@@ -7,6 +7,95 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
+# 仅有的可跳转 scheme；空串表示相对/协议相对/反斜杠形式，
+# 其安全性由 host 与 path 判定单独把关。
+_ALLOWED_SCHEMES = ("", "http", "https")
+
+_EMPTY_TARGET = {
+    "scheme": "",
+    "host": "",
+    "path": "",
+    "relative": False,
+    "protocol_relative": False,
+}
+
+
+def _clean(raw: str) -> str | None:
+    """清洗原始输入：去首尾空白、剔除 TAB/CR/LF、反斜杠归一为斜杠。
+
+    浏览器会忽略 TAB/CR/LF，并把反斜杠当作协议分隔符，因此判定前必须
+    先做这层还原，避免 ``java\\tscript:``、``\\\\evil.com`` 之类的混淆。
+    非字符串、空串或清洗后为空时返回 ``None``。
+    """
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    cleaned = (
+        cleaned.replace("\t", "")
+        .replace("\r", "")
+        .replace("\n", "")
+        .replace("\\", "/")
+    )
+    if not cleaned:
+        return None
+    return cleaned
+
+
+def _remove_dot_segments(path: str) -> str:
+    """按 RFC 3986 5.2.4 折叠 ``.``/``..`` 段，保留空段与结尾斜杠。"""
+    remaining = path
+    output: list[str] = []
+    while remaining:
+        if remaining.startswith("../"):
+            remaining = remaining[3:]
+        elif remaining.startswith("./"):
+            remaining = remaining[2:]
+        elif remaining.startswith("/./"):
+            remaining = "/" + remaining[3:]
+        elif remaining == "/.":
+            remaining = "/"
+        elif remaining.startswith("/../"):
+            remaining = "/" + remaining[4:]
+            if output:
+                output.pop()
+        elif remaining == "/..":
+            remaining = "/"
+            if output:
+                output.pop()
+        elif remaining in (".", ".."):
+            remaining = ""
+        else:
+            if remaining.startswith("/"):
+                cut = remaining.find("/", 1)
+            else:
+                cut = remaining.find("/")
+            if cut == -1:
+                segment, remaining = remaining, ""
+            else:
+                segment, remaining = remaining[:cut], remaining[cut:]
+            output.append(segment)
+    return "".join(output)
+
+
+def _split(raw: str):
+    """清洗并解析，返回 ``(cleaned, SplitResult)``；无法解析返回 ``None``。
+
+    访问 ``port`` 以触发坏端口/越界端口的 ValueError，统一按不可解析处理。
+    """
+    cleaned = _clean(raw)
+    if cleaned is None:
+        return None
+    try:
+        parts = urlsplit(cleaned)
+        _ = parts.port  # 坏端口在这里抛 ValueError
+    except ValueError:
+        return None
+    return cleaned, parts
+
 
 def normalize(url: str) -> str:
     r"""把 URL 规范化为可稳定比较的形式。
@@ -28,7 +117,41 @@ def normalize(url: str) -> str:
     返回:
         规范化后的字符串；无法解析时返回 ``""``。
     """
-    raise NotImplementedError("TODO: 实现零容差 URL 规范化")
+    try:
+        parsed = _split(url)
+        if parsed is None:
+            return ""
+        _cleaned, parts = parsed
+
+        scheme = parts.scheme.lower()
+        hostname = parts.hostname  # urlsplit 已对 host 做小写化
+        port = parts.port
+
+        # 重建不含 userinfo 的 authority；仅剥离 http/https 的默认端口。
+        netloc = ""
+        if hostname is not None:
+            host = f"[{hostname}]" if ":" in hostname else hostname
+            is_default_port = (
+                (scheme == "http" and port == 80)
+                or (scheme == "https" and port == 443)
+            )
+            netloc = host if (port is None or is_default_port) else f"{host}:{port}"
+
+        path = _remove_dot_segments(parts.path)
+        suffix = ""
+        if parts.query:
+            suffix += "?" + parts.query
+        if parts.fragment:
+            suffix += "#" + parts.fragment
+
+        if netloc:
+            head = f"{scheme}://{netloc}" if scheme else f"//{netloc}"
+            return head + path + suffix
+        if scheme:
+            return f"{scheme}:{path}{suffix}"
+        return path + suffix
+    except Exception:
+        return ""
 
 
 def parse_target(raw: str) -> dict:
@@ -58,7 +181,36 @@ def parse_target(raw: str) -> dict:
     返回:
         包含上述字段的 dict；不抛异常。
     """
-    raise NotImplementedError("TODO: 实现相对路径、协议相对 URL 与反斜杠的解析")
+    try:
+        parsed = _split(raw)
+        if parsed is None:
+            return dict(_EMPTY_TARGET)
+        cleaned, parts = parsed
+
+        scheme = parts.scheme.lower()
+        host = parts.hostname or ""
+        path = _remove_dot_segments(parts.path)
+        # 无 scheme 且以两个及以上 "/" 开头（含 "///host" 这类多斜杠写法，
+        # WHATWG 下浏览器同样按外部 authority 处理；urlsplit 会把多余斜杠
+        # 误当路径，这里显式纠回）。
+        force_protocol_relative = not scheme and cleaned.startswith("//")
+        # netloc 非空但 hostname 为空（例如 "//:8080/"）也算外部 authority，
+        # 交给上层按损坏目标拒绝，不能落回站内相对路径。
+        has_authority = (
+            parts.hostname is not None
+            or bool(parts.netloc)
+            or force_protocol_relative
+        )
+
+        return {
+            "scheme": scheme,
+            "host": host,
+            "path": path,
+            "relative": not scheme and not has_authority,
+            "protocol_relative": not scheme and has_authority,
+        }
+    except Exception:
+        return dict(_EMPTY_TARGET)
 
 
 def host_allowed(url: str, allow: list[str]) -> bool:
@@ -85,7 +237,31 @@ def host_allowed(url: str, allow: list[str]) -> bool:
     返回:
         命中时 ``True``，否则 ``False``；不抛异常。
     """
-    raise NotImplementedError("TODO: 实现按标签边界的 host 白名单匹配")
+    try:
+        host = parse_target(url)["host"]
+        if not host:
+            return False
+        for entry in allow:
+            if not isinstance(entry, str):
+                continue
+            item = entry.strip().lower()
+            if not item:
+                # 空项不授予任何权限；配置问题由 validate_allowlist 报告。
+                continue
+            if item.startswith("*."):
+                base = item[2:]
+                # "*" 与 "*.com" 这类只剩一级标签的通配不授予任何权限。
+                if "." not in base:
+                    continue
+                # 必须至少有一级子域，且按 DNS 标签边界命中。
+                if host.endswith("." + base) and len(host) > len(base) + 1:
+                    return True
+            else:
+                if host == item or host.endswith("." + item):
+                    return True
+        return False
+    except Exception:
+        return False
 
 
 def path_allowed(url: str, prefixes: list[str]) -> bool:
@@ -110,7 +286,26 @@ def path_allowed(url: str, prefixes: list[str]) -> bool:
     返回:
         路径命中任一有效前缀时为 ``True``；不抛异常。
     """
-    raise NotImplementedError("TODO: 实现带 / 边界和点段折叠的路径前缀匹配")
+    try:
+        path = parse_target(url)["path"]
+        if not path:
+            return False
+        for prefix in prefixes:
+            if not isinstance(prefix, str):
+                continue
+            item = prefix.strip()
+            if not item or not item.startswith("/"):
+                continue
+            item = item.rstrip("/")
+            if item == "":
+                # 前缀 "/"（或纯斜杠串）：匹配任意根相对站内路径。
+                if path.startswith("/"):
+                    return True
+            elif path == item or path.startswith(item + "/"):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def is_safe_target(raw: str, allow: list[str], prefixes: list[str]) -> bool:
@@ -138,7 +333,30 @@ def is_safe_target(raw: str, allow: list[str], prefixes: list[str]) -> bool:
     返回:
         目标可安全跳转时 ``True``，否则 ``False``。
     """
-    raise NotImplementedError("TODO: 实现 scheme、host、path 的综合安全判定")
+    try:
+        if not isinstance(raw, str) or not normalize(raw):
+            return False
+        target = parse_target(raw)
+        scheme = target["scheme"]
+
+        # 缺陷 6/8：scheme 白名单，javascript:/data: 等一律拒绝。
+        if scheme not in _ALLOWED_SCHEMES:
+            return False
+
+        if target["host"]:
+            # 缺陷 1/2/5：以剥离 userinfo 后的真实 host 按标签边界判定。
+            if not host_allowed(raw, allow):
+                return False
+        elif scheme or target["protocol_relative"]:
+            # 带 scheme 却没有 host、或 authority 损坏（空 host 的 // 形式）。
+            return False
+
+        # 缺陷 7：路径必须落在带斜杠边界的前缀内。
+        if not path_allowed(raw, prefixes):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def sanitize(raw: str, fallback: str) -> str:
@@ -160,7 +378,33 @@ def sanitize(raw: str, fallback: str) -> str:
     返回:
         安全的站内路径，或 ``fallback``。
     """
-    raise NotImplementedError("TODO: 实现非法目标回退到 fallback 的 sanitize")
+    try:
+        if not isinstance(raw, str) or not raw:
+            return fallback
+        # 任何控制字符（含 TAB/CR/LF 与 DEL）都不接受。
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+            return fallback
+        # 缺陷 4：反斜杠形式直接拒绝，不允许进入规范化后被还原成 //host。
+        if "\\" in raw:
+            return fallback
+
+        stripped = raw.strip()
+        if not stripped:
+            return fallback
+        # 缺陷 3：必须以单个 "/" 开头，"//"（协议相对）直接拒绝。
+        if not stripped.startswith("/") or stripped.startswith("//"):
+            return fallback
+
+        parts = urlsplit(stripped)
+        if parts.scheme or parts.netloc or parts.username is not None:
+            return fallback
+
+        normalized = normalize(stripped)
+        if not normalized or normalized.startswith("//") or not normalized.startswith("/"):
+            return fallback
+        return normalized
+    except Exception:
+        return fallback
 
 
 def validate_allowlist(allow: list[str], prefixes: list[str]) -> list[str]:
@@ -186,7 +430,33 @@ def validate_allowlist(allow: list[str], prefixes: list[str]) -> list[str]:
     返回:
         问题描述字符串列表；没有问题时为空列表。
     """
-    raise NotImplementedError("TODO: 实现空项、过宽通配与大小写配置校验")
+    issues: list[str] = []
+    try:
+        for index, entry in enumerate(allow):
+            if not isinstance(entry, str):
+                continue
+            if not entry.strip():
+                # 缺陷 10：空项等于允许任意目标，必须暴露出来。
+                issues.append(f"EMPTY_ALLOW:{index}")
+                continue
+            if entry == "*" or (
+                entry.startswith("*.") and "." not in entry[2:]
+            ):
+                issues.append(f"BROAD_WILDCARD:{index}:{entry}")
+            if any("A" <= ch <= "Z" for ch in entry):
+                issues.append(f"CASE_INCONSISTENT:{index}:{entry}")
+
+        for index, entry in enumerate(prefixes):
+            if not isinstance(entry, str):
+                continue
+            if not entry.strip():
+                issues.append(f"EMPTY_PREFIX:{index}")
+                continue
+            if not entry.startswith("/"):
+                issues.append(f"PREFIX_NOT_ABSOLUTE:{index}:{entry}")
+    except Exception:
+        return issues
+    return issues
 
 
 def redirect_batch(targets: list[str], config: dict) -> dict:
@@ -214,4 +484,38 @@ def redirect_batch(targets: list[str], config: dict) -> dict:
     返回:
         包含 results、allowed、blocked 的 dict；不抛异常。
     """
-    raise NotImplementedError("TODO: 实现各目标独立判定的批量跳转")
+    results: list[dict] = []
+    allowed = 0
+    blocked = 0
+    try:
+        if not isinstance(config, dict):
+            config = {}
+        allow = config.get("allow") or []
+        prefixes = config.get("prefixes") or []
+        fallback = config.get("fallback", "/")
+
+        for raw in targets:
+            try:
+                safe = is_safe_target(raw, allow, prefixes)
+                if safe:
+                    redirect = normalize(raw)
+                    # 理论上 safe 时必然可规范化；防御性兜底，绝不回显原地址。
+                    if not redirect:
+                        safe = False
+                        redirect = fallback
+                else:
+                    redirect = fallback
+            except Exception:
+                safe = False
+                redirect = fallback
+
+            if safe:
+                allowed += 1
+            else:
+                blocked += 1
+            results.append(
+                {"target": raw, "safe": safe, "redirect": redirect}
+            )
+    except Exception:
+        pass
+    return {"results": results, "allowed": allowed, "blocked": blocked}
