@@ -2,7 +2,7 @@
 
 ## 题面
 
-登录成功后跳回业务页，安全测试却用几个斜杠就把用户带去了钓鱼站：`evil-example.com` 被 host 白名单当成 `example.com` 放行；`*.example.com` 连裸域 `example.com` 也一起放行；协议相对地址 `//evil.com` 被当成站内相对路径；反斜杠写法 `\\evil.com` 被浏览器解释成协议分隔符却被当作普通路径；带 userinfo 的 `https://good.com@evil.com` 被认成 `good.com`；URL 里的制表符/换行把 `javascript:` 拆开后绕过 scheme 检查；路径前缀 `/app` 顺带放行 `/application`；综合判定只查 host 不查 scheme，让 `javascript:` 通行；拒绝时又把原始危险 URL 原样返回；白名单里的空字符串项等价于允许任意 host。redir/allowlist.py 是核心，tests/test_allowlist.py 15个红。要修的是：按零容差补齐规范化、目标解析、host/路径白名单、综合判定与配置校验，危险目标统一回退到默认页，并保证批量判定彼此独立。
+登录成功后跳回业务页，安全测试却用几个斜杠就把用户带去了钓鱼站：evil-example.com 被 host 白名单当成自家域；通配条目把裸域本身也放行；双斜杠开头的目标被当成相对路径；反斜杠开头的目标同样被当成路径；带用户信息的目标不剥离，看起来是自家域实际指向外部；制表符和换行被塞进 scheme 里，javascript 协议照样通过；路径前缀用裸 startswith，/app 命中 /application；只校验 host 不校验 scheme，data 协议也能跳；不安全目标直接回显原地址，等于放行；白名单允许空字符串项，等于允许任意目标。redir/allowlist.py 是核心，tests/test_allowlist.py 15个红。要修的是：按上面的顺序把 10 个缺陷逐个修掉。
 
 ## 运行方式
 
